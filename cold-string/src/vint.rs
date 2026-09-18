@@ -44,7 +44,7 @@ mod tests {
 
     fn assert_correct(x: u64) {
         let (wrote, b) = VarInt::write(x);
-        assert!(wrote >= 1 && wrote <= 10);
+        assert!((1..=10).contains(&wrote));
         let ptr = b.as_ptr();
         let (y, read) = unsafe { VarInt::read(ptr) };
         assert_eq!(wrote, read);

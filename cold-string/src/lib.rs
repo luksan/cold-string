@@ -5,11 +5,10 @@
 
 extern crate alloc;
 
-#[rustversion::before(1.84)]
-use sptr::Strict;
+#[cfg(test)]
+extern crate std;
 
 use alloc::{
-    alloc::{alloc, dealloc, Layout},
     borrow::{Cow, ToOwned},
     boxed::Box,
     str::Utf8Error,
@@ -20,21 +19,23 @@ use core::{
     fmt,
     hash::{Hash, Hasher},
     iter::FromIterator,
-    mem,
     ops::Deref,
-    ptr,
-    ptr::NonNull,
-    slice, str,
+    str,
 };
 
+#[cfg(test)]
+use core::{mem, ptr};
+
+mod arc;
+mod encoded;
+mod heap;
 mod vint;
-use crate::vint::VarInt;
+
+pub use crate::arc::ArcColdString;
+use crate::encoded::Encoded;
 
 #[cfg(feature = "rkyv")]
 mod rkyv;
-
-const HEAP_ALIGN: usize = 4;
-const WIDTH: usize = mem::size_of::<usize>();
 
 /// Compact representation of immutable UTF-8 strings. Optimized for memory usage and struct packing.
 ///
@@ -57,24 +58,12 @@ pub struct ColdString {
     ///   with the LSB bits of the tag byte. The address is always a multiple of 4 (`HEAP_ALIGN`).
     /// - 11111xxx: xxx is the length in range 0..=7, followed by length UTF-8 bytes.
     /// - xxxxxxxx (valid UTF-8): 8 UTF-8 bytes.
+    ///
     /// The exception is if `encoded` is `usize::MAX`, the UTF-8 bytes are "\0\0\0\0\0\0\0\0".
-    encoded: NonNull<u8>,
+    encoded: Encoded<()>,
 }
 
-static EIGHT_NUL: [u8; WIDTH] = [0u8; WIDTH];
-
 impl ColdString {
-    const TAG_MASK: usize = usize::from_ne_bytes(0b11000000usize.to_le_bytes());
-    const INLINE_TAG: usize = usize::from_ne_bytes(0b11111000usize.to_le_bytes());
-    const PTR_TAG: usize = usize::from_ne_bytes(0b10000000usize.to_le_bytes());
-    const LEN_MASK: usize = usize::from_ne_bytes(0b111usize.to_le_bytes());
-    const EIGHT_NUL_MAP: usize = usize::MAX;
-    const ROT: u32 = if cfg!(target_endian = "little") {
-        0
-    } else {
-        8 * (WIDTH - 1) as u32
-    };
-
     /// Convert a slice of bytes into a [`ColdString`].
     ///
     /// A [`ColdString`] is a contiguous collection of bytes (`u8`s) that is valid [`UTF-8`](https://en.wikipedia.org/wiki/UTF-8).
@@ -123,6 +112,10 @@ impl ColdString {
     ///
     /// assert_eq!("💖", sparkle_heart);
     /// ```
+    ///
+    /// # Safety
+    ///
+    /// `v` must contain valid UTF-8.
     pub unsafe fn from_utf8_unchecked<B: AsRef<[u8]>>(v: B) -> Self {
         Self::new(str::from_utf8_unchecked(v.as_ref()))
     }
@@ -132,63 +125,9 @@ impl ColdString {
     /// will be inlined on the stack.
     pub fn new<T: AsRef<str>>(x: T) -> Self {
         let s = x.as_ref();
-        if s.len() <= WIDTH {
-            Self::new_inline(s)
-        } else {
-            Self::new_heap(s)
+        Self {
+            encoded: Encoded::new(s, ()),
         }
-    }
-
-    #[rustversion::attr(since(1.61), const)]
-    #[inline]
-    fn new_eight_nul() -> Self {
-        // SAFETY: PTR_TAG is non-zero
-        unsafe { Self::from_inline_buf(Self::EIGHT_NUL_MAP.to_ne_bytes()) }
-    }
-
-    #[inline]
-    fn is_eight_nul(&self) -> bool {
-        self.addr() == Self::EIGHT_NUL_MAP
-    }
-
-    #[inline]
-    const fn inline_buf(s: &str) -> [u8; WIDTH] {
-        debug_assert!(s.len() <= WIDTH);
-        let mut buf = [0u8; WIDTH];
-        if s.len() < WIDTH {
-            let tag =
-                (Self::INLINE_TAG | s.len().rotate_left(Self::ROT)).rotate_right(Self::ROT) as u8;
-            buf[0] = tag;
-        }
-        buf
-    }
-
-    /// SAFETY: b must not be all-zero
-    #[rustversion::attr(since(1.61), const)]
-    #[inline]
-    unsafe fn from_inline_buf(b: [u8; WIDTH]) -> Self {
-        let encoded = ptr::null_mut::<u8>().wrapping_add(usize::from_ne_bytes(b));
-        let encoded = NonNull::new_unchecked(encoded);
-        Self { encoded }
-    }
-
-    #[inline]
-    const fn utf8_start(l: usize) -> usize {
-        (l < WIDTH) as usize
-    }
-
-    #[inline]
-    fn new_inline(s: &str) -> Self {
-        if s.as_bytes() == EIGHT_NUL {
-            return Self::new_eight_nul();
-        }
-        let mut buf = Self::inline_buf(s);
-        let start = Self::utf8_start(s.len());
-        buf[start..s.len() + start].copy_from_slice(s.as_bytes());
-        // SAFETY:
-        // it is checked at the top of the function than s is not all NUL
-        // and the inline tag is not 0, so shorter strings will also be not all NUL
-        unsafe { Self::from_inline_buf(buf) }
     }
 
     /// Creates a new inline [`ColdString`] from `&'static str` at compile time.
@@ -209,102 +148,15 @@ impl ColdString {
     #[rustversion::since(1.61)]
     #[inline]
     pub const fn new_inline_const(s: &str) -> Self {
-        if s.len() > WIDTH {
-            panic!(
-                "Length for `new_inline_const` must be less than `core::mem::size_of::<usize>()`."
-            );
+        Self {
+            encoded: Encoded::new_inline_const(s),
         }
-        if s.len() == WIDTH {
-            // can't do a slice comparison in const context
-            let bytes = unsafe { *(s.as_bytes() as *const _ as *const [u8; WIDTH]) };
-            let int = usize::from_ne_bytes(bytes);
-            if int == 0 {
-                return Self::new_eight_nul();
-            }
-        }
-        let mut buf = Self::inline_buf(s);
-        let start = Self::utf8_start(s.len());
-        let mut i = 0;
-        while i < s.len() {
-            buf[i + start] = s.as_bytes()[i];
-            i += 1;
-        }
-        // SAFETY:
-        // It is checked at the top of the function than s is not all NUL,
-        // and the inline tag is not 0, so shorter strings will also be not all NUL.
-        unsafe { Self::from_inline_buf(buf) }
-    }
-
-    #[rustversion::attr(since(1.71), const)]
-    #[inline]
-    fn ptr(&self) -> *const u8 {
-        self.encoded.as_ptr()
-    }
-
-    #[inline]
-    fn addr(&self) -> usize {
-        self.ptr().addr()
-    }
-
-    #[inline]
-    fn tag(&self) -> usize {
-        self.addr() & Self::TAG_MASK
     }
 
     /// Returns `true` if the string bytes are inlined.
     #[inline]
     pub fn is_inline(&self) -> bool {
-        self.tag() != Self::PTR_TAG
-    }
-
-    #[inline]
-    fn new_heap(s: &str) -> Self {
-        let len = s.len();
-        let (vint_len, len_buf) = VarInt::write(len as u64);
-        let total = vint_len + len;
-        let layout = Layout::from_size_align(total, HEAP_ALIGN).unwrap();
-
-        unsafe {
-            // SAFETY: the layout size is non-zero, since the smallest VarInt is one byte
-            let ptr = alloc(layout);
-            if ptr.is_null() {
-                alloc::alloc::handle_alloc_error(layout);
-            }
-
-            // TODO: can optimize this
-            ptr::copy_nonoverlapping(len_buf.as_ptr(), ptr, vint_len);
-            ptr::copy_nonoverlapping(s.as_ptr(), ptr.add(vint_len), len);
-            let encoded = ptr.map_addr(|addr| {
-                debug_assert!(addr % HEAP_ALIGN == 0);
-                let mut addr = addr.rotate_left(6 + Self::ROT);
-                addr |= Self::PTR_TAG;
-                addr
-            });
-            // SAFETY: encoded != 0 because Self::PTR_TAG != 0
-            let encoded = NonNull::new_unchecked(encoded);
-            Self { encoded }
-        }
-    }
-
-    #[inline]
-    fn heap_ptr(&self) -> *const u8 {
-        debug_assert!(!self.is_inline());
-        self.ptr().map_addr(|mut addr| {
-            addr ^= Self::PTR_TAG;
-            let addr = addr.rotate_right(6 + Self::ROT);
-            debug_assert!(addr % HEAP_ALIGN == 0);
-            addr
-        })
-    }
-
-    #[inline]
-    fn inline_len(&self) -> usize {
-        debug_assert!(!self.is_eight_nul());
-        let addr = self.addr();
-        match addr & Self::INLINE_TAG {
-            Self::INLINE_TAG => (addr & Self::LEN_MASK).rotate_right(Self::ROT),
-            _ => WIDTH,
-        }
+        self.encoded.is_inline()
     }
 
     /// Returns the length of this `ColdString`, in bytes, not [`char`]s or
@@ -325,39 +177,7 @@ impl ColdString {
     /// ```
     #[inline]
     pub fn len(&self) -> usize {
-        if self.is_eight_nul() {
-            return WIDTH;
-        } else if self.is_inline() {
-            self.inline_len()
-        } else {
-            unsafe {
-                let ptr = self.heap_ptr();
-                let (len, _) = VarInt::read(ptr);
-                len as usize
-            }
-        }
-    }
-
-    #[allow(unsafe_op_in_unsafe_fn)]
-    #[inline]
-    unsafe fn decode_inline(&self) -> &[u8] {
-        if self.is_eight_nul() {
-            return &EIGHT_NUL;
-        }
-        let len = self.inline_len();
-        // SAFETY: addr_of! avoids &self.ptr (which is UB due to alignment)
-        let self_bytes_ptr = ptr::addr_of!(self.encoded) as *const u8;
-        let start = Self::utf8_start(len);
-        slice::from_raw_parts(self_bytes_ptr.add(start), len)
-    }
-
-    #[allow(unsafe_op_in_unsafe_fn)]
-    #[inline]
-    unsafe fn decode_heap(&self) -> &[u8] {
-        let ptr = self.heap_ptr();
-        let (len, header) = VarInt::read(ptr);
-        let data = ptr.add(header);
-        slice::from_raw_parts(data, len)
+        self.encoded.len()
     }
 
     /// Returns a byte slice of this `ColdString`'s contents.
@@ -375,10 +195,7 @@ impl ColdString {
     /// ```
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        match self.is_inline() {
-            true => unsafe { self.decode_inline() },
-            false => unsafe { self.decode_heap() },
-        }
+        self.encoded.as_bytes()
     }
 
     /// Returns a string slice containing the entire [`ColdString`].
@@ -410,7 +227,7 @@ impl ColdString {
 
 impl Default for ColdString {
     fn default() -> Self {
-        Self::new_inline("")
+        Self::new("")
     }
 }
 
@@ -424,14 +241,8 @@ impl Deref for ColdString {
 impl Drop for ColdString {
     fn drop(&mut self) {
         if !self.is_inline() {
-            let ptr = self.heap_ptr();
-            unsafe {
-                let (len, header) = VarInt::read(ptr);
-                let total = header + len;
-                let layout = Layout::from_size_align(total, HEAP_ALIGN).unwrap();
-                // SAFETY: if ptr is non-null then it was allocated by alloc() in new_heap()
-                dealloc(ptr as *mut u8, layout);
-            }
+            // SAFETY: a non-inline `ColdString` uniquely owns its allocation.
+            unsafe { self.encoded.deallocate() }
         }
     }
 }
@@ -439,22 +250,18 @@ impl Drop for ColdString {
 impl Clone for ColdString {
     fn clone(&self) -> Self {
         if self.is_inline() {
-            let ptr = self.ptr();
-            let encoded = unsafe { NonNull::new_unchecked(ptr as *mut _) };
-            Self { encoded }
+            Self {
+                encoded: self.encoded,
+            }
         } else {
-            Self::new_heap(self.as_str())
+            Self::new(self.as_str())
         }
     }
 }
 
 impl PartialEq for ColdString {
     fn eq(&self, other: &Self) -> bool {
-        match (self.is_inline(), other.is_inline()) {
-            (true, true) => self.ptr() == other.ptr(),
-            (false, false) => unsafe { self.decode_heap() == other.decode_heap() },
-            _ => false,
-        }
+        self.encoded.addr() == other.encoded.addr() || self.as_bytes() == other.as_bytes()
     }
 }
 
@@ -512,10 +319,7 @@ impl<'a> From<&'a ColdString> for Cow<'a, str> {
 
 impl<'a> From<Cow<'a, str>> for ColdString {
     fn from(cow: Cow<'a, str>) -> Self {
-        match cow {
-            Cow::Borrowed(s) => s.into(),
-            Cow::Owned(s) => s.into(),
-        }
+        Self::new(cow)
     }
 }
 
@@ -529,8 +333,7 @@ impl From<Box<str>> for ColdString {
 
 impl FromIterator<char> for ColdString {
     fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> Self {
-        let s: String = iter.into_iter().collect();
-        ColdString::new(&s)
+        Self::new(iter.into_iter().collect::<String>())
     }
 }
 
@@ -545,11 +348,7 @@ impl core::borrow::Borrow<str> for ColdString {
 
 impl PartialEq<str> for ColdString {
     fn eq(&self, other: &str) -> bool {
-        if self.is_inline() {
-            unsafe { self.decode_inline() == other.as_bytes() }
-        } else {
-            unsafe { self.decode_heap() == other.as_bytes() }
-        }
+        self.as_str() == other
     }
 }
 
@@ -593,7 +392,7 @@ impl Ord for ColdString {
 
 impl PartialOrd for ColdString {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.as_str().partial_cmp(other.as_str())
+        Some(self.cmp(other))
     }
 }
 
@@ -676,7 +475,7 @@ mod tests {
         assert_eq!(*s, cs);
         let opt_s = Some(cs.clone());
         assert_eq!(opt_s, Some(ColdString::new(s)));
-        assert!(opt_s != None);
+        assert!(opt_s.is_some());
     }
 
     #[test]
@@ -781,21 +580,21 @@ mod tests {
 
     #[test]
     fn ensure_zero_repr() {
-        assert!(str::from_utf8(&ColdString::EIGHT_NUL_MAP.to_ne_bytes()).is_err());
+        assert!(str::from_utf8(&Encoded::<()>::EIGHT_NUL_MAP.to_ne_bytes()).is_err());
     }
 
     #[test]
     fn test_const_8nul_vs_non_const() {
-        let nul8 = str::from_utf8(&EIGHT_NUL).unwrap();
+        let nul8 = str::from_utf8(&encoded::EIGHT_NUL).unwrap();
         let const8 = ColdString::new_inline_const(nul8);
         let non_const = ColdString::new(nul8);
         let cloned = non_const.clone();
-        assert_eq!(const8.ptr(), non_const.ptr());
-        assert_eq!(const8.ptr(), cloned.ptr());
+        assert_eq!(const8.encoded.addr(), non_const.encoded.addr());
+        assert_eq!(const8.encoded.addr(), cloned.encoded.addr());
         // check that a null pointer will return a str pointing to EIGHT_NUL
         assert_eq!(
             &const8.as_str().as_bytes()[0] as *const u8,
-            (&EIGHT_NUL) as *const u8
+            (&encoded::EIGHT_NUL) as *const u8
         );
     }
 }

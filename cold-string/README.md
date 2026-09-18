@@ -33,6 +33,20 @@ let s = ColdString::new("qwerty");
 assert_eq!(s.as_str(), "qwerty");
 ```
 
+Use `ArcColdString` when clones should share long-string storage:
+
+```rust
+use cold_string::ArcColdString;
+
+let first = ArcColdString::new("a string longer than one machine word");
+let second = first.clone();
+assert_eq!(first, second);
+```
+
+Both types keep strings up to one machine word inline. For longer strings,
+`ArcColdString` stores `[atomic reference count][variable-length length][UTF-8 bytes]`
+in one allocation and does not support weak references.
+
 Packs well with other types:
 ```rust
 use cold_string::ColdString;
@@ -47,19 +61,14 @@ assert_eq!(size_of::<Option<ColdString>>(), size_of::<ColdString>());
 
 ColdString is an 8-byte tagged pointer (4 bytes on 32-bit machines):
 
-```rust
-use std::ptr::NonNull;
-
-#[repr(transparent)]
-pub struct ColdString {
-    encoded: NonNull<u8>,
-}
-```
+Internally, both string types use a one-word tagged pointer representation.
+`ColdString` points to a `[variable-length length][UTF-8 bytes]` allocation,
+while `ArcColdString` adds an atomic reference count before the same payload.
 The 8 bytes encode one of three representations indicated by the 1st byte:
-- `10xxxxxx`: `encoded` contains a tagged heap pointer. To decode the address, clear the tag bits (`10 → 00`) and rotate so the `00` bits become the least-significant bits. The heap allocation uses [4-byte alignment](https://doc.rust-lang.org/beta/std/alloc/struct.Layout.html#method.from_size_align), guaranteeing the
-least-significant 2 bits of the address are `00`. On the heap, the UTF-8 characters are preceded by the variable-length encoding of the size. The size uses 1 byte for 0 - 127, 2 bytes for 128 - 16383, etc.
+- `10xxxxxx`: `encoded` contains a tagged heap pointer. To decode the address, clear the tag bits (`10 → 00`) and rotate so the `00` bits become the least-significant bits. The heap allocation uses [4-byte alignment](https://doc.rust-lang.org/beta/std/alloc/struct.Layout.html#method.from_size_align), guaranteeing the least-significant 2 bits of the address are `00`. On the heap, the UTF-8 characters are preceded by the variable-length encoding of the size. The size uses 1 byte for 0 - 127, 2 bytes for 128 - 16383, etc.
 - `11111xxx`: xxx is the length and the remaining 0-7 bytes are UTF-8 characters.
 - `xxxxxxxx`: All 8 bytes are UTF-8.
+
 The exception is if `encoded` is `usize::MAX`, the UTF-8 bytes are "\0\0\0\0\0\0\0\0".
 
 `10xxxxxx` and `11111xxx` are chosen because they cannot be valid first bytes of UTF-8.
