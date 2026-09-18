@@ -26,6 +26,10 @@ jobs:
       run: cargo +1.74 hack test --manifest-path cold-string/Cargo.toml --verbose --feature-powerset --exclude-features rkyv
     - name: Tests
       run: cargo hack test --manifest-path cold-string/Cargo.toml --verbose --feature-powerset
+    - name: Loom
+      env:
+        RUSTFLAGS: --cfg loom
+      run: cargo test --manifest-path cold-string/Cargo.toml --lib loom_clone_drop
     - name: Install nightly + Miri
       run: |
           rustup toolchain install nightly

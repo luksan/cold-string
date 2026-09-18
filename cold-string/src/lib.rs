@@ -1,5 +1,6 @@
 #![allow(rustdoc::bare_urls)]
 #![doc = include_str!("../README.md")]
+#![allow(unknown_lints, unexpected_cfgs)]
 #![allow(unstable_name_collisions)]
 #![no_std]
 

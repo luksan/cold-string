@@ -11,8 +11,12 @@ use core::{
     iter::FromIterator,
     ops::Deref,
     str,
-    sync::atomic::{fence, AtomicUsize, Ordering as AtomicOrdering},
 };
+
+#[cfg(not(all(loom, test)))]
+use core::sync::atomic::{fence, AtomicUsize, Ordering as AtomicOrdering};
+#[cfg(all(loom, test))]
+use loom::sync::atomic::{fence, AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::encoded::Encoded;
 
@@ -359,6 +363,35 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(value.count().load(AtomicOrdering::Relaxed), REF_ONE);
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_clone_drop() {
+        loom::model(|| {
+            const TEXT: &str = "a shared string longer than one machine word";
+
+            let value = ArcColdString::new(TEXT);
+            let left = value.clone();
+            let right = value.clone();
+
+            let left = loom::thread::spawn(move || {
+                let clone = left.clone();
+                assert_eq!(clone.as_str(), TEXT);
+                drop(clone);
+                drop(left);
+            });
+            let right = loom::thread::spawn(move || {
+                let clone = right.clone();
+                assert_eq!(clone.as_str(), TEXT);
+                drop(right);
+                drop(clone);
+            });
+
+            left.join().unwrap();
+            right.join().unwrap();
+            assert_eq!(value.count().load(AtomicOrdering::Relaxed), REF_ONE);
+        });
     }
 
     #[test]
