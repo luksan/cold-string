@@ -15,11 +15,11 @@ use core::{
 
 #[cfg(all(loom, test, target_arch = "x86_64"))]
 use loom::sync::atomic::{
-    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
+    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering::*,
 };
 #[cfg(not(all(loom, test, target_arch = "x86_64")))]
 use portable_atomic::{
-    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
+    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering::*,
 };
 
 use crate::encoded::Encoded;
@@ -50,7 +50,7 @@ macro_rules! impl_ref_count {
 
             #[inline]
             fn increment(&self) {
-                let mut old = self.load(AtomicOrdering::Relaxed);
+                let mut old = self.load(Relaxed);
                 loop {
                     if old & 1 != 0 {
                         return;
@@ -61,12 +61,7 @@ macro_rules! impl_ref_count {
                     } else {
                         old + 2
                     };
-                    match self.compare_exchange_weak(
-                        old,
-                        new,
-                        AtomicOrdering::Relaxed,
-                        AtomicOrdering::Relaxed,
-                    ) {
+                    match self.compare_exchange_weak(old, new, Relaxed, Relaxed) {
                         Ok(_) => return,
                         Err(actual) => old = actual,
                     }
@@ -75,15 +70,12 @@ macro_rules! impl_ref_count {
 
             #[inline]
             fn decrement(&self) -> bool {
-                if self.load(AtomicOrdering::Relaxed) & 1 != 0 {
-                    return false;
-                }
-                self.fetch_sub(2, AtomicOrdering::Release) == 2
+                self.fetch_sub(2, Release) == 2
             }
 
             #[cfg(test)]
             fn refs(&self) -> usize {
-                (self.load(AtomicOrdering::Relaxed) >> 1) as usize
+                (self.load(Relaxed) >> 1) as usize
             }
 
             #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
@@ -93,7 +85,7 @@ macro_rules! impl_ref_count {
 
             #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
             fn is_immortal(&self) -> bool {
-                self.load(AtomicOrdering::Relaxed) & 1 != 0
+                self.load(Relaxed) & 1 != 0
             }
         }
     };
@@ -222,7 +214,7 @@ impl<A: RefCount> Drop for ArcColdStringInner<A> {
             return;
         }
 
-        fence(AtomicOrdering::Acquire);
+        fence(Acquire);
         // SAFETY: this was the last reference and the count is synchronized.
         unsafe { self.encoded.deallocate() }
     }
