@@ -39,6 +39,6 @@ jobs:
     - name: Miri 64 bit BE
       run: cargo +nightly miri test --all-features --manifest-path cold-string/Cargo.toml --target powerpc64-unknown-linux-gnu
     - name: Miri 32 bit LE
-      run: cargo +nightly miri test --all-features --target i686-unknown-linux-gnu
+      run: cargo +nightly miri test --all-features --manifest-path cold-string/Cargo.toml --target i686-unknown-linux-gnu
     - name: Miri 32 bit BE
       run: cargo +nightly miri test --all-features --manifest-path cold-string/Cargo.toml --target mips-unknown-linux-gnu

@@ -13,11 +13,11 @@ use core::{
     str,
 };
 
-#[cfg(all(loom, test))]
+#[cfg(all(loom, test, target_arch = "x86_64"))]
 use loom::sync::atomic::{
     fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
 };
-#[cfg(not(all(loom, test)))]
+#[cfg(not(all(loom, test, target_arch = "x86_64")))]
 use portable_atomic::{
     fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
 };
@@ -33,10 +33,10 @@ pub trait RefCount: Send + Sync + 'static {
     #[cfg(test)]
     fn refs(&self) -> usize;
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
     fn near_overflow() -> Self;
 
-    #[cfg(all(test, not(loom)))]
+    #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
     fn is_immortal(&self) -> bool;
 }
 
@@ -86,12 +86,12 @@ macro_rules! impl_ref_count {
                 (self.load(AtomicOrdering::Relaxed) >> 1) as usize
             }
 
-            #[cfg(all(test, not(loom)))]
+            #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
             fn near_overflow() -> Self {
                 Self::new(<$int>::MAX - 1)
             }
 
-            #[cfg(all(test, not(loom)))]
+            #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
             fn is_immortal(&self) -> bool {
                 self.load(AtomicOrdering::Relaxed) & 1 != 0
             }
@@ -429,7 +429,7 @@ mod tests {
     }
 
     fn assert_inline_and_heap_clone<A: RefCount>() {
-        let inline = ArcColdStringInner::<A>::new("short");
+        let inline = ArcColdStringInner::<A>::new("tiny");
         let inline_clone = inline.clone();
         assert!(inline.is_inline());
         assert_eq!(inline, inline_clone);
@@ -470,7 +470,7 @@ mod tests {
         each_ref_count!(assert_clones_across_threads);
     }
 
-    #[cfg(loom)]
+    #[cfg(all(loom, target_arch = "x86_64"))]
     fn model_clone_drop<A: RefCount>() {
         loom::model(|| {
             const TEXT: &str = "a shared string longer than one machine word";
@@ -498,13 +498,13 @@ mod tests {
         });
     }
 
-    #[cfg(loom)]
+    #[cfg(all(loom, target_arch = "x86_64"))]
     #[test]
     fn loom_clone_drop() {
         each_ref_count!(model_clone_drop);
     }
 
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, target_arch = "x86_64")))]
     fn assert_count_becomes_immortal<A: RefCount>() {
         let count = A::near_overflow();
         count.increment();
@@ -512,7 +512,7 @@ mod tests {
         assert!(!count.decrement());
     }
 
-    #[cfg(not(loom))]
+    #[cfg(not(all(loom, target_arch = "x86_64")))]
     #[test]
     fn count_becomes_immortal_without_wrapping() {
         each_ref_count!(assert_count_becomes_immortal);

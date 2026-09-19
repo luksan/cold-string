@@ -29,6 +29,9 @@ rustversion = "1.0.22"
 
 [dev-dependencies]
 hashbrown = "0.12.3"
-loom = "0.7.2"
 serde_test = "1.0.177"
 proptest = {version = "=1.8.0", default-features = false, features = ["std", "bit-set"] }
+
+# Keep Loom's native generator dependency out of cross-target Miri builds.
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+loom = "0.7.2"
