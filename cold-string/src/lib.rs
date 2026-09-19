@@ -33,6 +33,9 @@ mod heap;
 mod vint;
 
 pub use crate::arc::ArcColdString;
+pub use crate::arc::ArcColdString16;
+pub use crate::arc::ArcColdString32;
+pub use crate::arc::ArcColdString8;
 use crate::encoded::Encoded;
 
 #[cfg(feature = "rkyv")]
@@ -419,22 +422,113 @@ impl<'de> serde::Deserialize<'de> for ColdString {
     }
 }
 
+#[cfg(test)]
+trait TestString:
+    Clone + Default + fmt::Debug + Eq + Hash + PartialEq<str> + for<'a> PartialEq<&'a str>
+{
+    fn new(s: &str) -> Self;
+    fn new_inline(s: &str) -> Self;
+    fn is_inline(&self) -> bool;
+    fn len(&self) -> usize;
+    fn as_bytes(&self) -> &[u8];
+    fn as_str(&self) -> &str;
+    fn encoded_addr(&self) -> usize;
+}
+
+#[cfg(test)]
+impl TestString for ColdString {
+    fn new(s: &str) -> Self {
+        Self::new(s)
+    }
+
+    fn new_inline(s: &str) -> Self {
+        Self::new_inline_const(s)
+    }
+
+    fn is_inline(&self) -> bool {
+        self.is_inline()
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
+    fn as_str(&self) -> &str {
+        self.as_str()
+    }
+
+    fn encoded_addr(&self) -> usize {
+        self.encoded.addr()
+    }
+}
+
+#[cfg(test)]
+impl<A: arc::RefCount> TestString for arc::ArcColdStringInner<A> {
+    fn new(s: &str) -> Self {
+        Self::new(s)
+    }
+
+    fn new_inline(s: &str) -> Self {
+        Self::new_inline_const(s)
+    }
+
+    fn is_inline(&self) -> bool {
+        self.is_inline()
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
+    fn as_str(&self) -> &str {
+        self.as_str()
+    }
+
+    fn encoded_addr(&self) -> usize {
+        self.encoded_addr()
+    }
+}
+
+#[cfg(test)]
+macro_rules! each_string {
+    ($test:ident $(, $arg:expr)*) => {
+        $test::<ColdString>($($arg),*);
+        $test::<ArcColdString>($($arg),*);
+        $test::<ArcColdString8>($($arg),*);
+        $test::<ArcColdString16>($($arg),*);
+        $test::<ArcColdString32>($($arg),*);
+    };
+}
+
 #[cfg(all(test, feature = "serde"))]
 mod serde_tests {
     use super::*;
     use serde_test::{assert_tokens, Token};
 
+    fn assert_serde<T>(s: &'static str)
+    where
+        T: TestString + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    {
+        assert_tokens(&T::new(s), &[Token::Str(s)]);
+    }
+
     #[test]
     fn test_serde_cold_string_inline() {
-        let cs = ColdString::new("ferris");
-        assert_tokens(&cs, &[Token::Str("ferris")]);
+        each_string!(assert_serde, "ferris");
     }
 
     #[test]
     fn test_serde_cold_string_heap() {
         let long_str = "This is a significantly longer string for heap testing";
-        let cs = ColdString::new(long_str);
-        assert_tokens(&cs, &[Token::Str(long_str)]);
+        each_string!(assert_serde, long_str);
     }
 }
 
@@ -444,25 +538,38 @@ mod tests {
     use core::hash::BuildHasher;
     use hashbrown::hash_map::DefaultHashBuilder;
 
+    fn assert_layout<T: TestString>() {
+        assert_eq!(mem::size_of::<T>(), mem::size_of::<usize>());
+        assert_eq!(mem::size_of::<Option<T>>(), mem::size_of::<T>());
+    }
+
     #[test]
     fn test_layout() {
-        assert_eq!(mem::size_of::<ColdString>(), mem::size_of::<usize>());
+        each_string!(assert_layout);
+    }
+
+    fn assert_default<T: TestString>() {
+        assert!(T::default().as_str().is_empty());
+        assert_eq!(T::default().len(), 0);
+        assert_eq!(T::default(), "");
+        assert_eq!(T::default(), T::new(""));
     }
 
     #[test]
     fn test_default() {
-        assert!(ColdString::default().is_empty());
-        assert_eq!(ColdString::default().len(), 0);
-        assert_eq!(ColdString::default(), "");
-        assert_eq!(ColdString::default(), ColdString::new(""));
+        each_string!(assert_default);
     }
 
-    fn assert_correct(s: &str) {
-        let cs = ColdString::new(s);
+    fn assert_correct<T: TestString>(s: &str)
+    where
+        str: PartialEq<T>,
+        for<'a> &'a str: PartialEq<T>,
+    {
+        let cs = T::new(s);
         assert_eq!(s.len() <= mem::size_of::<usize>(), cs.is_inline());
         assert_eq!(cs.len(), s.len());
         assert_eq!(cs.as_bytes(), s.as_bytes());
-        assert_eq!(cs.as_str(), s);
+        assert_eq!(cs.as_str().as_bytes(), s.as_bytes());
         assert_eq!(cs.clone(), cs);
         let bh = DefaultHashBuilder::new();
         let mut hasher1 = bh.build_hasher();
@@ -475,7 +582,7 @@ mod tests {
         assert_eq!(cs, *s);
         assert_eq!(*s, cs);
         let opt_s = Some(cs.clone());
-        assert_eq!(opt_s, Some(ColdString::new(s)));
+        assert_eq!(opt_s, Some(T::new(s)));
         assert!(opt_s.is_some());
     }
 
@@ -513,7 +620,7 @@ mod tests {
             "AaAa0 ® ",
             str::from_utf8(&[240, 158, 186, 128, 240, 145, 143, 151]).unwrap(),
         ] {
-            assert_correct(s);
+            each_string!(assert_correct, s);
         }
     }
 
@@ -558,19 +665,18 @@ mod tests {
                     s.push(c);
                 }
 
-                assert_correct(&s);
+                each_string!(assert_correct, &s);
             }
         }
     }
 
-    #[test]
-    fn test_unaligned_placement() {
+    fn assert_unaligned_placement<T: TestString>() {
         for s_content in ["torture", "tor", "tortures", "tort", "torture torture"] {
             let mut buffer = [0u8; 32];
             for offset in 0..8 {
                 unsafe {
-                    let dst = buffer.as_mut_ptr().add(offset) as *mut ColdString;
-                    let s = ColdString::new(s_content);
+                    let dst = buffer.as_mut_ptr().add(offset).cast::<T>();
+                    let s = T::new(s_content);
                     ptr::write_unaligned(dst, s);
                     let recovered = ptr::read_unaligned(dst);
                     assert_eq!(recovered.as_str(), s_content);
@@ -580,22 +686,31 @@ mod tests {
     }
 
     #[test]
+    fn test_unaligned_placement() {
+        each_string!(assert_unaligned_placement);
+    }
+
+    #[test]
     fn ensure_zero_repr() {
         assert!(str::from_utf8(&Encoded::<()>::EIGHT_NUL_MAP.to_ne_bytes()).is_err());
     }
 
-    #[test]
-    fn test_const_8nul_vs_non_const() {
+    fn assert_const_8nul_vs_non_const<T: TestString>() {
         let nul8 = str::from_utf8(&encoded::EIGHT_NUL).unwrap();
-        let const8 = ColdString::new_inline_const(nul8);
-        let non_const = ColdString::new(nul8);
+        let const8 = T::new_inline(nul8);
+        let non_const = T::new(nul8);
         let cloned = non_const.clone();
-        assert_eq!(const8.encoded.addr(), non_const.encoded.addr());
-        assert_eq!(const8.encoded.addr(), cloned.encoded.addr());
+        assert_eq!(const8.encoded_addr(), non_const.encoded_addr());
+        assert_eq!(const8.encoded_addr(), cloned.encoded_addr());
         // check that a null pointer will return a str pointing to EIGHT_NUL
         assert_eq!(
             &const8.as_str().as_bytes()[0] as *const u8,
             (&encoded::EIGHT_NUL) as *const u8
         );
+    }
+
+    #[test]
+    fn test_const_8nul_vs_non_const() {
+        each_string!(assert_const_8nul_vs_non_const);
     }
 }

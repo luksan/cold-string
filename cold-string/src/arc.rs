@@ -13,16 +13,102 @@ use core::{
     str,
 };
 
-#[cfg(not(all(loom, test)))]
-use core::sync::atomic::{fence, AtomicUsize, Ordering as AtomicOrdering};
 #[cfg(all(loom, test))]
-use loom::sync::atomic::{fence, AtomicUsize, Ordering as AtomicOrdering};
+use loom::sync::atomic::{
+    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
+};
+#[cfg(not(all(loom, test)))]
+use portable_atomic::{
+    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering as AtomicOrdering,
+};
 
 use crate::encoded::Encoded;
 
-const IMMORTAL: usize = 1;
-const REF_ONE: usize = 2;
-const MAX_REFCOUNT: usize = usize::MAX / 4;
+#[doc(hidden)]
+pub trait RefCount: Send + Sync + 'static {
+    fn new() -> Self;
+    fn increment(&self);
+    fn decrement(&self) -> bool;
+
+    #[cfg(test)]
+    fn refs(&self) -> usize;
+
+    #[cfg(all(test, not(loom)))]
+    fn near_overflow() -> Self;
+
+    #[cfg(all(test, not(loom)))]
+    fn is_immortal(&self) -> bool;
+}
+
+macro_rules! impl_ref_count {
+    ($atomic:ty, $int:ty) => {
+        impl RefCount for $atomic {
+            #[inline]
+            fn new() -> Self {
+                <$atomic>::new(2)
+            }
+
+            #[inline]
+            fn increment(&self) {
+                let mut old = self.load(AtomicOrdering::Relaxed);
+                loop {
+                    if old & 1 != 0 {
+                        return;
+                    }
+
+                    let new = if old == <$int>::MAX - 1 {
+                        <$int>::MAX
+                    } else {
+                        old + 2
+                    };
+                    match self.compare_exchange_weak(
+                        old,
+                        new,
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                    ) {
+                        Ok(_) => return,
+                        Err(actual) => old = actual,
+                    }
+                }
+            }
+
+            #[inline]
+            fn decrement(&self) -> bool {
+                if self.load(AtomicOrdering::Relaxed) & 1 != 0 {
+                    return false;
+                }
+                self.fetch_sub(2, AtomicOrdering::Release) == 2
+            }
+
+            #[cfg(test)]
+            fn refs(&self) -> usize {
+                (self.load(AtomicOrdering::Relaxed) >> 1) as usize
+            }
+
+            #[cfg(all(test, not(loom)))]
+            fn near_overflow() -> Self {
+                Self::new(<$int>::MAX - 1)
+            }
+
+            #[cfg(all(test, not(loom)))]
+            fn is_immortal(&self) -> bool {
+                self.load(AtomicOrdering::Relaxed) & 1 != 0
+            }
+        }
+    };
+}
+
+impl_ref_count!(AtomicU8, u8);
+impl_ref_count!(AtomicU16, u16);
+impl_ref_count!(AtomicU32, u32);
+impl_ref_count!(AtomicUsize, usize);
+
+#[doc(hidden)]
+#[repr(transparent)]
+pub struct ArcColdStringInner<A: RefCount> {
+    encoded: Encoded<A>,
+}
 
 /// A one-word, atomically reference-counted immutable UTF-8 string.
 ///
@@ -36,12 +122,18 @@ const MAX_REFCOUNT: usize = usize::MAX / 4;
 /// let second = first.clone();
 /// assert_eq!(first, second);
 /// ```
-#[repr(transparent)]
-pub struct ArcColdString {
-    encoded: Encoded<AtomicUsize>,
-}
+pub type ArcColdString = ArcColdStringInner<AtomicUsize>;
 
-impl ArcColdString {
+/// An [`ArcColdString`] with an 8-bit reference count.
+pub type ArcColdString8 = ArcColdStringInner<AtomicU8>;
+
+/// An [`ArcColdString`] with a 16-bit reference count.
+pub type ArcColdString16 = ArcColdStringInner<AtomicU16>;
+
+/// An [`ArcColdString`] with a 32-bit reference count.
+pub type ArcColdString32 = ArcColdStringInner<AtomicU32>;
+
+impl<A: RefCount> ArcColdStringInner<A> {
     pub fn from_utf8<B: AsRef<[u8]>>(bytes: B) -> Result<Self, Utf8Error> {
         Ok(Self::new(str::from_utf8(bytes.as_ref())?))
     }
@@ -56,7 +148,7 @@ impl ArcColdString {
     pub fn new<T: AsRef<str>>(value: T) -> Self {
         let s = value.as_ref();
         Self {
-            encoded: Encoded::new(s, AtomicUsize::new(REF_ONE)),
+            encoded: Encoded::new(s, A::new()),
         }
     }
 
@@ -69,9 +161,14 @@ impl ArcColdString {
     }
 
     #[inline]
-    fn count(&self) -> &AtomicUsize {
+    fn count(&self) -> &A {
         debug_assert!(!self.is_inline());
         unsafe { &(*self.encoded.heap_ptr().as_ptr()).header }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encoded_addr(&self) -> usize {
+        self.encoded.addr()
     }
 
     #[inline]
@@ -101,19 +198,11 @@ impl ArcColdString {
     }
 }
 
-impl Clone for ArcColdString {
+impl<A: RefCount> Clone for ArcColdStringInner<A> {
     #[inline]
     fn clone(&self) -> Self {
         if !self.is_inline() {
-            let count = self.count();
-            if count.load(AtomicOrdering::Relaxed) & IMMORTAL == 0 {
-                let old = count.fetch_add(REF_ONE, AtomicOrdering::Relaxed);
-                if old >> 1 >= MAX_REFCOUNT {
-                    // Permanently leak the allocation instead of allowing the
-                    // count to wrap. The spare range covers racing increments.
-                    count.fetch_or(IMMORTAL, AtomicOrdering::Relaxed);
-                }
-            }
+            self.count().increment();
         }
 
         Self {
@@ -122,20 +211,14 @@ impl Clone for ArcColdString {
     }
 }
 
-impl Drop for ArcColdString {
+impl<A: RefCount> Drop for ArcColdStringInner<A> {
     #[inline]
     fn drop(&mut self) {
         if self.is_inline() {
             return;
         }
 
-        let count = self.count();
-        if count.load(AtomicOrdering::Relaxed) & IMMORTAL != 0 {
-            return;
-        }
-
-        let old = count.fetch_sub(REF_ONE, AtomicOrdering::Release);
-        if old & IMMORTAL != 0 || old != REF_ONE {
+        if !self.count().decrement() {
             return;
         }
 
@@ -145,13 +228,13 @@ impl Drop for ArcColdString {
     }
 }
 
-impl Default for ArcColdString {
+impl<A: RefCount> Default for ArcColdStringInner<A> {
     fn default() -> Self {
         Self::new("")
     }
 }
 
-impl Deref for ArcColdString {
+impl<A: RefCount> Deref for ArcColdStringInner<A> {
     type Target = str;
 
     fn deref(&self) -> &str {
@@ -159,135 +242,135 @@ impl Deref for ArcColdString {
     }
 }
 
-impl PartialEq for ArcColdString {
+impl<A: RefCount> PartialEq for ArcColdStringInner<A> {
     fn eq(&self, other: &Self) -> bool {
         self.encoded.addr() == other.encoded.addr() || self.as_bytes() == other.as_bytes()
     }
 }
 
-impl Eq for ArcColdString {}
+impl<A: RefCount> Eq for ArcColdStringInner<A> {}
 
-impl Hash for ArcColdString {
+impl<A: RefCount> Hash for ArcColdStringInner<A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_str().hash(state)
     }
 }
 
-impl fmt::Debug for ArcColdString {
+impl<A: RefCount> fmt::Debug for ArcColdStringInner<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
-impl fmt::Display for ArcColdString {
+impl<A: RefCount> fmt::Display for ArcColdStringInner<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self.as_str(), f)
     }
 }
 
-impl From<&str> for ArcColdString {
+impl<A: RefCount> From<&str> for ArcColdStringInner<A> {
     fn from(s: &str) -> Self {
         Self::new(s)
     }
 }
 
-impl From<String> for ArcColdString {
+impl<A: RefCount> From<String> for ArcColdStringInner<A> {
     fn from(s: String) -> Self {
         Self::new(&s)
     }
 }
 
-impl From<Box<str>> for ArcColdString {
+impl<A: RefCount> From<Box<str>> for ArcColdStringInner<A> {
     fn from(s: Box<str>) -> Self {
         Self::new(&s)
     }
 }
 
-impl From<ArcColdString> for String {
-    fn from(s: ArcColdString) -> Self {
+impl<A: RefCount> From<ArcColdStringInner<A>> for String {
+    fn from(s: ArcColdStringInner<A>) -> Self {
         s.as_str().to_owned()
     }
 }
 
-impl From<ArcColdString> for Cow<'_, str> {
-    fn from(s: ArcColdString) -> Self {
+impl<A: RefCount> From<ArcColdStringInner<A>> for Cow<'_, str> {
+    fn from(s: ArcColdStringInner<A>) -> Self {
         Self::Owned(s.into())
     }
 }
 
-impl<'a> From<&'a ArcColdString> for Cow<'a, str> {
-    fn from(s: &'a ArcColdString) -> Self {
+impl<'a, A: RefCount> From<&'a ArcColdStringInner<A>> for Cow<'a, str> {
+    fn from(s: &'a ArcColdStringInner<A>) -> Self {
         Self::Borrowed(s)
     }
 }
 
-impl<'a> From<Cow<'a, str>> for ArcColdString {
+impl<'a, A: RefCount> From<Cow<'a, str>> for ArcColdStringInner<A> {
     fn from(s: Cow<'a, str>) -> Self {
         Self::new(s)
     }
 }
 
-impl FromIterator<char> for ArcColdString {
+impl<A: RefCount> FromIterator<char> for ArcColdStringInner<A> {
     fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> Self {
         Self::new(iter.into_iter().collect::<String>())
     }
 }
 
-impl core::borrow::Borrow<str> for ArcColdString {
+impl<A: RefCount> core::borrow::Borrow<str> for ArcColdStringInner<A> {
     fn borrow(&self) -> &str {
         self.as_str()
     }
 }
 
-impl PartialEq<str> for ArcColdString {
+impl<A: RefCount> PartialEq<str> for ArcColdStringInner<A> {
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
     }
 }
 
-impl PartialEq<ArcColdString> for str {
-    fn eq(&self, other: &ArcColdString) -> bool {
+impl<A: RefCount> PartialEq<ArcColdStringInner<A>> for str {
+    fn eq(&self, other: &ArcColdStringInner<A>) -> bool {
         other == self
     }
 }
 
-impl PartialEq<&str> for ArcColdString {
+impl<A: RefCount> PartialEq<&str> for ArcColdStringInner<A> {
     fn eq(&self, other: &&str) -> bool {
         self == *other
     }
 }
 
-impl PartialEq<ArcColdString> for &str {
-    fn eq(&self, other: &ArcColdString) -> bool {
+impl<A: RefCount> PartialEq<ArcColdStringInner<A>> for &str {
+    fn eq(&self, other: &ArcColdStringInner<A>) -> bool {
         other == *self
     }
 }
 
-impl AsRef<str> for ArcColdString {
+impl<A: RefCount> AsRef<str> for ArcColdStringInner<A> {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl AsRef<[u8]> for ArcColdString {
+impl<A: RefCount> AsRef<[u8]> for ArcColdStringInner<A> {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
 }
 
-impl Ord for ArcColdString {
+impl<A: RefCount> Ord for ArcColdStringInner<A> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.as_str().cmp(other.as_str())
     }
 }
 
-impl PartialOrd for ArcColdString {
+impl<A: RefCount> PartialOrd for ArcColdStringInner<A> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl str::FromStr for ArcColdString {
+impl<A: RefCount> str::FromStr for ArcColdStringInner<A> {
     type Err = core::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -296,60 +379,77 @@ impl str::FromStr for ArcColdString {
 }
 
 #[cfg(feature = "serde")]
-impl serde::Serialize for ArcColdString {
+impl<A: RefCount> serde::Serialize for ArcColdStringInner<A> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for ArcColdString {
+impl<'de, A: RefCount> serde::Deserialize<'de> for ArcColdStringInner<A> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Ok(Self::new(s))
     }
 }
 
-unsafe impl Send for ArcColdString {}
-unsafe impl Sync for ArcColdString {}
+unsafe impl<A: RefCount> Send for ArcColdStringInner<A> {}
+unsafe impl<A: RefCount> Sync for ArcColdStringInner<A> {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::mem::{align_of, size_of};
 
-    type ArcInner = crate::heap::VintStringInner<AtomicUsize>;
+    macro_rules! each_ref_count {
+        ($test:ident) => {
+            $test::<AtomicU8>();
+            $test::<AtomicU16>();
+            $test::<AtomicU32>();
+            $test::<AtomicUsize>();
+        };
+    }
 
-    #[test]
-    fn layout() {
-        assert_eq!(size_of::<ArcColdString>(), size_of::<usize>());
+    fn assert_layout<A: RefCount>() {
+        assert_eq!(size_of::<ArcColdStringInner<A>>(), size_of::<usize>());
         assert_eq!(
-            size_of::<Option<ArcColdString>>(),
-            size_of::<ArcColdString>()
+            size_of::<Option<ArcColdStringInner<A>>>(),
+            size_of::<ArcColdStringInner<A>>()
         );
-        assert_eq!(size_of::<ArcInner>(), size_of::<AtomicUsize>());
-        assert_eq!(align_of::<ArcInner>(), align_of::<AtomicUsize>());
+        assert_eq!(size_of::<crate::heap::VintStringInner<A>>(), size_of::<A>());
+        assert_eq!(
+            align_of::<crate::heap::VintStringInner<A>>(),
+            align_of::<A>()
+        );
     }
 
     #[test]
-    fn inline_and_heap_clone() {
-        let inline = ArcColdString::new("short");
+    fn layout() {
+        each_ref_count!(assert_layout);
+    }
+
+    fn assert_inline_and_heap_clone<A: RefCount>() {
+        let inline = ArcColdStringInner::<A>::new("short");
         let inline_clone = inline.clone();
         assert!(inline.is_inline());
         assert_eq!(inline, inline_clone);
 
-        let heap = ArcColdString::new("a string longer than one machine word");
+        let heap = ArcColdStringInner::<A>::new("a string longer than one machine word");
         let heap_clone = heap.clone();
         assert!(!heap.is_inline());
         assert_eq!(heap.encoded.addr(), heap_clone.encoded.addr());
-        assert_eq!(heap.count().load(AtomicOrdering::Relaxed), 2 * REF_ONE);
+        assert_eq!(heap.count().refs(), 2);
         drop(heap_clone);
-        assert_eq!(heap.count().load(AtomicOrdering::Relaxed), REF_ONE);
+        assert_eq!(heap.count().refs(), 1);
     }
 
     #[test]
-    fn clones_across_threads() {
-        let value = ArcColdString::new("a shared string longer than one machine word");
+    fn inline_and_heap_clone() {
+        each_ref_count!(assert_inline_and_heap_clone);
+    }
+
+    fn assert_clones_across_threads<A: RefCount>() {
+        let value = ArcColdStringInner::<A>::new("a shared string longer than one machine word");
         let threads: alloc::vec::Vec<_> = (0..8)
             .map(|_| {
                 let clone = value.clone();
@@ -362,16 +462,20 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(value.count().load(AtomicOrdering::Relaxed), REF_ONE);
+        assert_eq!(value.count().refs(), 1);
+    }
+
+    #[test]
+    fn clones_across_threads() {
+        each_ref_count!(assert_clones_across_threads);
     }
 
     #[cfg(loom)]
-    #[test]
-    fn loom_clone_drop() {
+    fn model_clone_drop<A: RefCount>() {
         loom::model(|| {
             const TEXT: &str = "a shared string longer than one machine word";
 
-            let value = ArcColdString::new(TEXT);
+            let value = ArcColdStringInner::<A>::new(TEXT);
             let left = value.clone();
             let right = value.clone();
 
@@ -390,25 +494,60 @@ mod tests {
 
             left.join().unwrap();
             right.join().unwrap();
-            assert_eq!(value.count().load(AtomicOrdering::Relaxed), REF_ONE);
+            assert_eq!(value.count().refs(), 1);
         });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_clone_drop() {
+        each_ref_count!(model_clone_drop);
+    }
+
+    #[cfg(not(loom))]
+    fn assert_count_becomes_immortal<A: RefCount>() {
+        let count = A::near_overflow();
+        count.increment();
+        assert!(count.is_immortal());
+        assert!(!count.decrement());
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn count_becomes_immortal_without_wrapping() {
+        each_ref_count!(assert_count_becomes_immortal);
     }
 
     #[test]
     fn const_inline_matches_runtime() {
-        const VALUE: ArcColdString = ArcColdString::new_inline_const("cold");
-        assert_eq!(VALUE, ArcColdString::new("cold"));
+        macro_rules! assert_const_inline {
+            ($atomic:ty) => {{
+                const VALUE: ArcColdStringInner<$atomic> =
+                    ArcColdStringInner::<$atomic>::new_inline_const("cold");
+                assert_eq!(VALUE, ArcColdStringInner::<$atomic>::new("cold"));
+            }};
+        }
+
+        assert_const_inline!(AtomicU8);
+        assert_const_inline!(AtomicU16);
+        assert_const_inline!(AtomicU32);
+        assert_const_inline!(AtomicUsize);
+    }
+
+    #[cfg(feature = "serde")]
+    fn assert_serde_roundtrip<A: RefCount>() {
+        use serde_test::{assert_tokens, Token};
+
+        let value = ArcColdStringInner::<A>::new("a shared string longer than one machine word");
+        assert_tokens(
+            &value,
+            &[Token::Str("a shared string longer than one machine word")],
+        );
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn serde_roundtrip_shape() {
-        use serde_test::{assert_tokens, Token};
-
-        let value = ArcColdString::new("a shared string longer than one machine word");
-        assert_tokens(
-            &value,
-            &[Token::Str("a shared string longer than one machine word")],
-        );
+        each_ref_count!(assert_serde_roundtrip);
     }
 }

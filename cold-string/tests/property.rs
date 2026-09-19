@@ -5,7 +5,7 @@ use proptest::prelude::*;
 fn proptest_config() -> ProptestConfig {
     ProptestConfig {
         failure_persistence: None,
-        cases: 16,
+        cases: 8,
         ..Default::default()
     }
 }

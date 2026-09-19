@@ -43,6 +43,10 @@ let second = first.clone();
 assert_eq!(first, second);
 ```
 
+`ArcColdString` uses a native-width reference count. `ArcColdString8`,
+`ArcColdString16`, and `ArcColdString32` use 1-, 2-, and 4-byte counts when a
+smaller heap header is preferable. All variants remain one word in size.
+
 Both types keep strings up to one machine word inline. For longer strings,
 `ArcColdString` stores `[atomic reference count][variable-length length][UTF-8 bytes]`
 in one allocation and does not support weak references.
