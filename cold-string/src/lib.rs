@@ -63,7 +63,7 @@ pub struct ColdString {
     /// - 11111xxx: xxx is the length in range 0..=7, followed by length UTF-8 bytes.
     /// - xxxxxxxx (valid UTF-8): 8 UTF-8 bytes.
     ///
-    /// The exception is if `encoded` is `usize::MAX`, the UTF-8 bytes are "\0\0\0\0\0\0\0\0".
+    /// The exception is if `encoded` is `usize::MAX`, which represents one word of NUL bytes.
     encoded: Encoded<()>,
 }
 
@@ -125,7 +125,7 @@ impl ColdString {
     }
 
     /// Creates a new [`ColdString`] from any type that implements `AsRef<str>`.
-    /// If the string is shorter than `core::mem::size_of::<usize>()`, then it
+    /// If the string is at most `core::mem::size_of::<usize>()` bytes, then it
     /// will be inlined on the stack.
     pub fn new<T: AsRef<str>>(x: T) -> Self {
         let s = x.as_ref();
@@ -139,7 +139,7 @@ impl ColdString {
     /// In a dynamic context you can use the method [`ColdString::new()`].
     ///
     /// # Panics
-    /// The string must be less than `core::mem::size_of::<usize>()`. Creating
+    /// The string must be at most `core::mem::size_of::<usize>()`. Creating
     /// a [`ColdString`] larger than that is not supported.
     ///
     ///
@@ -427,8 +427,10 @@ trait TestString:
     Clone + Default + fmt::Debug + Eq + Hash + PartialEq<str> + for<'a> PartialEq<&'a str>
 {
     fn new(s: &str) -> Self;
+    fn from_utf8(bytes: &[u8]) -> Result<Self, Utf8Error>;
     fn new_inline(s: &str) -> Self;
     fn is_inline(&self) -> bool;
+    fn is_empty(&self) -> bool;
     fn len(&self) -> usize;
     fn as_bytes(&self) -> &[u8];
     fn as_str(&self) -> &str;
@@ -441,12 +443,20 @@ impl TestString for ColdString {
         Self::new(s)
     }
 
+    fn from_utf8(bytes: &[u8]) -> Result<Self, Utf8Error> {
+        Self::from_utf8(bytes)
+    }
+
     fn new_inline(s: &str) -> Self {
         Self::new_inline_const(s)
     }
 
     fn is_inline(&self) -> bool {
         self.is_inline()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 
     fn len(&self) -> usize {
@@ -472,12 +482,20 @@ impl<A: arc::RefCount> TestString for arc::ArcColdStringInner<A> {
         Self::new(s)
     }
 
+    fn from_utf8(bytes: &[u8]) -> Result<Self, Utf8Error> {
+        Self::from_utf8(bytes)
+    }
+
     fn new_inline(s: &str) -> Self {
         Self::new_inline_const(s)
     }
 
     fn is_inline(&self) -> bool {
         self.is_inline()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 
     fn len(&self) -> usize {
@@ -549,7 +567,7 @@ mod tests {
     }
 
     fn assert_default<T: TestString>() {
-        assert!(T::default().as_str().is_empty());
+        assert!(T::default().is_empty());
         assert_eq!(T::default().len(), 0);
         assert_eq!(T::default(), "");
         assert_eq!(T::default(), T::new(""));
@@ -558,6 +576,26 @@ mod tests {
     #[test]
     fn test_default() {
         each_string!(assert_default);
+    }
+
+    fn assert_utf8_validation<T: TestString>() {
+        for valid in ["", "🦀", "valid UTF-8 🦀 longer than one word"] {
+            assert_eq!(T::from_utf8(valid.as_bytes()).unwrap().as_str(), valid);
+        }
+
+        for invalid in [
+            &[0x80][..],
+            &[0xff][..],
+            &[0xc0, 0x80][..],
+            &[0xe2, 0x82][..],
+        ] {
+            assert!(T::from_utf8(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn test_utf8_validation() {
+        each_string!(assert_utf8_validation);
     }
 
     fn assert_correct<T: TestString>(s: &str)
@@ -692,25 +730,25 @@ mod tests {
 
     #[test]
     fn ensure_zero_repr() {
-        assert!(str::from_utf8(&Encoded::<()>::EIGHT_NUL_MAP.to_ne_bytes()).is_err());
+        assert!(str::from_utf8(&Encoded::<()>::WORD_NUL_MAP.to_ne_bytes()).is_err());
     }
 
-    fn assert_const_8nul_vs_non_const<T: TestString>() {
-        let nul8 = str::from_utf8(&encoded::EIGHT_NUL).unwrap();
-        let const8 = T::new_inline(nul8);
-        let non_const = T::new(nul8);
+    fn assert_const_word_nul<T: TestString>() {
+        let nul = str::from_utf8(&encoded::WORD_NUL).unwrap();
+        let const_value = T::new_inline(nul);
+        let non_const = T::new(nul);
         let cloned = non_const.clone();
-        assert_eq!(const8.encoded_addr(), non_const.encoded_addr());
-        assert_eq!(const8.encoded_addr(), cloned.encoded_addr());
-        // check that a null pointer will return a str pointing to EIGHT_NUL
+        assert_eq!(const_value.encoded_addr(), non_const.encoded_addr());
+        assert_eq!(const_value.encoded_addr(), cloned.encoded_addr());
+        // The sentinel returns a slice into the shared word-sized NUL array.
         assert_eq!(
-            &const8.as_str().as_bytes()[0] as *const u8,
-            (&encoded::EIGHT_NUL) as *const u8
+            &const_value.as_str().as_bytes()[0] as *const u8,
+            (&encoded::WORD_NUL) as *const u8
         );
     }
 
     #[test]
-    fn test_const_8nul_vs_non_const() {
-        each_string!(assert_const_8nul_vs_non_const);
+    fn test_const_word_nul() {
+        each_string!(assert_const_word_nul);
     }
 }

@@ -73,7 +73,7 @@ The 8 bytes encode one of three representations indicated by the 1st byte:
 - `11111xxx`: xxx is the length and the remaining 0-7 bytes are UTF-8 characters.
 - `xxxxxxxx`: All 8 bytes are UTF-8.
 
-The exception is if `encoded` is `usize::MAX`, the UTF-8 bytes are "\0\0\0\0\0\0\0\0".
+The exception is if `encoded` is `usize::MAX`, which represents one word of NUL bytes.
 
 `10xxxxxx` and `11111xxx` are chosen because they cannot be valid first bytes of UTF-8.
 

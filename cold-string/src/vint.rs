@@ -53,12 +53,17 @@ mod tests {
 
     #[test]
     fn vint_round_trip() {
-        for x in [0, 1, 42, 59243, 5, 8, 7, 63, 64] {
+        for x in 0..=1024 {
             assert_correct(x);
         }
 
-        for x in 0..=u16::MAX {
-            assert_correct(x as u64);
+        let mut shift = 7;
+        while shift < usize::BITS {
+            let boundary = 1usize << shift;
+            for x in boundary - 1..=boundary + 1 {
+                assert_correct(x as u64);
+            }
+            shift += 7;
         }
 
         for x in 0..=100 {

@@ -9,7 +9,7 @@ use sptr::Strict;
 use crate::heap::{VintStringInner, HEAP_ALIGN};
 
 pub(crate) const WIDTH: usize = mem::size_of::<usize>();
-pub(crate) static EIGHT_NUL: [u8; WIDTH] = [0u8; WIDTH];
+pub(crate) static WORD_NUL: [u8; WIDTH] = [0u8; WIDTH];
 
 /// The common one-word representation used by both owning string types.
 #[repr(transparent)]
@@ -30,7 +30,7 @@ impl<H> Encoded<H> {
     const INLINE_TAG: usize = usize::from_ne_bytes(0b11111000usize.to_le_bytes());
     const PTR_TAG: usize = usize::from_ne_bytes(0b10000000usize.to_le_bytes());
     const LEN_MASK: usize = usize::from_ne_bytes(0b111usize.to_le_bytes());
-    pub(crate) const EIGHT_NUL_MAP: usize = usize::MAX;
+    pub(crate) const WORD_NUL_MAP: usize = usize::MAX;
     const ROT: u32 = if cfg!(target_endian = "little") {
         0
     } else {
@@ -49,8 +49,8 @@ impl<H> Encoded<H> {
     #[inline]
     pub(crate) fn new_inline(s: &str) -> Self {
         debug_assert!(s.len() <= WIDTH);
-        if s.as_bytes() == EIGHT_NUL {
-            return Self::new_eight_nul();
+        if s.as_bytes() == WORD_NUL {
+            return Self::new_word_nul();
         }
         let mut buf = Self::inline_buf(s);
         let start = Self::utf8_start(s.len());
@@ -66,7 +66,7 @@ impl<H> Encoded<H> {
     pub(crate) const fn new_inline_const(s: &str) -> Self {
         if s.len() > WIDTH {
             panic!(
-                "Length for `new_inline_const` must be less than `core::mem::size_of::<usize>()`."
+                "Length for `new_inline_const` must be at most `core::mem::size_of::<usize>()`."
             );
         }
         let mut buf = Self::inline_buf(s);
@@ -78,7 +78,7 @@ impl<H> Encoded<H> {
         }
 
         if usize::from_ne_bytes(buf) == 0 {
-            return Self::new_eight_nul();
+            return Self::new_word_nul();
         }
 
         // SAFETY: the all-zero representation was handled above.
@@ -140,14 +140,14 @@ impl<H> Encoded<H> {
     }
 
     #[inline]
-    fn is_eight_nul(&self) -> bool {
-        self.addr() == Self::EIGHT_NUL_MAP
+    fn is_word_nul(&self) -> bool {
+        self.addr() == Self::WORD_NUL_MAP
     }
 
     #[inline]
     fn inline_len(&self) -> usize {
         debug_assert!(self.is_inline());
-        debug_assert!(!self.is_eight_nul());
+        debug_assert!(!self.is_word_nul());
         let addr = self.addr();
         match addr & Self::INLINE_TAG {
             Self::INLINE_TAG => (addr & Self::LEN_MASK).rotate_right(Self::ROT),
@@ -158,8 +158,8 @@ impl<H> Encoded<H> {
     #[inline]
     pub(crate) unsafe fn inline_bytes(&self) -> &[u8] {
         debug_assert!(self.is_inline());
-        if self.is_eight_nul() {
-            return &EIGHT_NUL;
+        if self.is_word_nul() {
+            return &WORD_NUL;
         }
         let len = self.inline_len();
         let bytes = ptr::addr_of!(self.ptr).cast::<u8>();
@@ -189,9 +189,9 @@ impl<H> Encoded<H> {
     }
 
     #[inline]
-    const fn new_eight_nul() -> Self {
-        // SAFETY: `EIGHT_NUL_MAP` is non-zero.
-        unsafe { Self::from_inline_buf(Self::EIGHT_NUL_MAP.to_ne_bytes()) }
+    const fn new_word_nul() -> Self {
+        // SAFETY: `WORD_NUL_MAP` is non-zero.
+        unsafe { Self::from_inline_buf(Self::WORD_NUL_MAP.to_ne_bytes()) }
     }
 
     /// `buf` must not be all zeroes.

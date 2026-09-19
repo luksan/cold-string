@@ -14,13 +14,9 @@ use core::{
 };
 
 #[cfg(all(loom, test, target_arch = "x86_64"))]
-use loom::sync::atomic::{
-    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering::*,
-};
+use loom::sync::atomic::{fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering::*};
 #[cfg(not(all(loom, test, target_arch = "x86_64")))]
-use portable_atomic::{
-    fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering::*,
-};
+use portable_atomic::{fence, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering::*};
 
 use crate::encoded::Encoded;
 
@@ -33,11 +29,14 @@ pub trait RefCount: Send + Sync + 'static {
     #[cfg(test)]
     fn refs(&self) -> usize;
 
-    #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
+    #[cfg(test)]
     fn near_overflow() -> Self;
 
-    #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
+    #[cfg(test)]
     fn is_immortal(&self) -> bool;
+
+    #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
+    fn min_immortal() -> Self;
 }
 
 macro_rules! impl_ref_count {
@@ -78,14 +77,19 @@ macro_rules! impl_ref_count {
                 (self.load(Relaxed) >> 1) as usize
             }
 
-            #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
+            #[cfg(test)]
             fn near_overflow() -> Self {
                 Self::new(<$int>::MAX - 1)
             }
 
-            #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
+            #[cfg(test)]
             fn is_immortal(&self) -> bool {
                 self.load(Relaxed) & 1 != 0
+            }
+
+            #[cfg(all(test, not(all(loom, target_arch = "x86_64"))))]
+            fn min_immortal() -> Self {
+                Self::new(1)
             }
         }
     };
@@ -106,6 +110,8 @@ pub struct ArcColdStringInner<A: RefCount> {
 ///
 /// Strings up to one machine word are stored inline. Longer strings use one
 /// allocation containing the reference count, variable-length length, and bytes.
+/// If the reference count saturates, the allocation becomes immortal (and is
+/// never deallocated) rather than allowing the count to wrap.
 ///
 /// ```
 /// use cold_string::ArcColdString;
@@ -117,12 +123,21 @@ pub struct ArcColdStringInner<A: RefCount> {
 pub type ArcColdString = ArcColdStringInner<AtomicUsize>;
 
 /// An [`ArcColdString`] with an 8-bit reference count.
+///
+/// It supports up to 127 live references. Cloning beyond that makes the
+/// allocation immortal.
 pub type ArcColdString8 = ArcColdStringInner<AtomicU8>;
 
 /// An [`ArcColdString`] with a 16-bit reference count.
+///
+/// It supports up to 32,767 live references. Cloning beyond that makes the
+/// allocation immortal.
 pub type ArcColdString16 = ArcColdStringInner<AtomicU16>;
 
 /// An [`ArcColdString`] with a 32-bit reference count.
+///
+/// It supports up to 2,147,483,647 live references. Cloning beyond that makes
+/// the allocation immortal.
 pub type ArcColdString32 = ArcColdStringInner<AtomicU32>;
 
 impl<A: RefCount> ArcColdStringInner<A> {
@@ -430,6 +445,11 @@ mod tests {
         let heap_clone = heap.clone();
         assert!(!heap.is_inline());
         assert_eq!(heap.encoded.addr(), heap_clone.encoded.addr());
+        assert_eq!(
+            heap.encoded.heap_ptr().as_ptr() as usize
+                % core::cmp::max(align_of::<A>(), crate::heap::HEAP_ALIGN),
+            0
+        );
         assert_eq!(heap.count().refs(), 2);
         drop(heap_clone);
         assert_eq!(heap.count().refs(), 1);
@@ -491,23 +511,78 @@ mod tests {
     }
 
     #[cfg(all(loom, target_arch = "x86_64"))]
+    fn model_final_drop<A: RefCount>() {
+        loom::model(|| {
+            let first =
+                ArcColdStringInner::<A>::new("a shared string longer than one machine word");
+            let second = first.clone();
+
+            let first = loom::thread::spawn(move || drop(first));
+            let second = loom::thread::spawn(move || drop(second));
+
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+    }
+
+    #[cfg(all(loom, target_arch = "x86_64"))]
+    fn model_overflow_race<A: RefCount>() {
+        loom::model(|| {
+            let count = loom::sync::Arc::new(A::near_overflow());
+            let expected_refs = count.refs();
+            let increment = count.clone();
+            let decrement = count.clone();
+
+            let increment = loom::thread::spawn(move || increment.increment());
+            let decrement = loom::thread::spawn(move || assert!(!decrement.decrement()));
+
+            increment.join().unwrap();
+            decrement.join().unwrap();
+
+            if count.is_immortal() {
+                assert!(!count.decrement());
+                assert!(count.is_immortal());
+            } else {
+                assert_eq!(count.refs(), expected_refs);
+            }
+        });
+    }
+
+    #[cfg(all(loom, target_arch = "x86_64"))]
     #[test]
     fn loom_clone_drop() {
         each_ref_count!(model_clone_drop);
+        each_ref_count!(model_final_drop);
+        each_ref_count!(model_overflow_race);
     }
 
     #[cfg(not(all(loom, target_arch = "x86_64")))]
-    fn assert_count_becomes_immortal<A: RefCount>() {
+    fn assert_refcount_edges<A: RefCount>() {
+        let count = A::new();
+        assert_eq!(count.refs(), 1);
+        count.increment();
+        assert_eq!(count.refs(), 2);
+        assert!(!count.decrement());
+        assert_eq!(count.refs(), 1);
+        assert!(count.decrement());
+        assert_eq!(count.refs(), 0);
+
         let count = A::near_overflow();
         count.increment();
         assert!(count.is_immortal());
         assert!(!count.decrement());
+        assert!(count.is_immortal());
+
+        let count = A::min_immortal();
+        assert!(count.is_immortal());
+        assert!(!count.decrement());
+        assert!(count.is_immortal());
     }
 
     #[cfg(not(all(loom, target_arch = "x86_64")))]
     #[test]
-    fn count_becomes_immortal_without_wrapping() {
-        each_ref_count!(assert_count_becomes_immortal);
+    fn refcount_edges() {
+        each_ref_count!(assert_refcount_edges);
     }
 
     #[test]
