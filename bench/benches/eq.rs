@@ -18,9 +18,9 @@ where
         left_strings.push(random_string::<String>(len, len));
     }
 
-    for i in 0..COUNT {
+    for left in &left_strings {
         if fastrand::f64() < eq_ratio {
-            right_strings.push(left_strings[i].clone());
+            right_strings.push(left.clone());
         } else {
             right_strings.push(random_string::<String>(len, len));
         }

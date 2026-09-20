@@ -37,22 +37,22 @@ fn allocator_memory<T: FromStr>(name: &str) {
     const SIZE: usize = 48;
     const TRIALS: usize = 100;
 
-    let mut memory: [f64; SIZE as usize + 1] = [0.0; SIZE as usize + 1];
+    let mut memory: [f64; SIZE + 1] = [0.0; SIZE + 1];
     let now = Instant::now();
 
-    for size in 0..=SIZE {
+    for (size, memory) in memory.iter_mut().enumerate() {
         let base = ALLOCATED.load(Ordering::SeqCst);
         let mut strings: Vec<T> = Vec::with_capacity(TRIALS);
         for _ in 0..TRIALS {
             strings.push(random_string(size, size));
         }
         let mem_used = ALLOCATED.load(Ordering::SeqCst) - base;
-        memory[size] = mem_used as f64 / TRIALS as f64;
+        *memory = mem_used as f64 / TRIALS as f64;
     }
 
     let mut file = std::fs::File::create(format!("{}.csv", name)).unwrap();
-    for items in 0..=SIZE {
-        let row = format!("{},{}\n", items, memory[items as usize]);
+    for (items, memory) in memory.iter().enumerate() {
+        let row = format!("{items},{memory}\n");
         file.write_all(row.as_bytes()).unwrap();
     }
 
@@ -145,7 +145,7 @@ fn system_memory(name: &str, workload: impl Fn(usize, usize)) {
         let _vsz = (proc.virtual_memory() - base_virt) as f64 / (TRIALS as f64);
         print!(" | {:>CELL_WIDTH$.1}", rss);
     }
-    print!("\n");
+    println!();
 }
 
 fn print_table_header(title: &str) {

@@ -150,6 +150,69 @@ smartstring        |       14.7 |       14.8 |        8.6 |       61.6 |       6
 smol_str           |       15.2 |       12.8 |       15.7 |       41.7 |       42.0
 std                |       28.2 |       27.6 |       28.6 |       29.3 |       30.4
 
+### Reference Counting Memory Comparison
+
+Theoretical overhead on a 64-bit target, excluding one pointer and the UTF-8
+payload. Inline values have no pointer or heap allocation, so their overhead is
+shown relative to the string bytes alone. Allocator rounding is not included.
+
+Type              | 8 bytes    | 128 bytes | 512 bytes
+:---              |       ---: |       ---: |       ---:
+`Arc<str>`        |         24 |         24 |         24
+`arcstr::ArcStr`  |         16 |         16 |         16
+`ArcColdString`   | 0 (inline) |          9 |         10
+`ArcColdString32` | 0 (inline) |          5 |          6
+
+RSS bytes per unique string in a pre-sized `Vec`, measured on 64-bit Windows
+with 1,000,000 strings per subprocess. Each cell is the median of three isolated
+release-mode runs and includes the `Vec` element, heap allocation, and allocator
+rounding. RSS results will vary by operating system and allocator.
+
+Type              | 8 bytes | 128 bytes | 512 bytes
+:---              |    ---: |     ---: |     ---:
+`Arc<str>`        |     47.1 |      175.4 |      560.0
+`arcstr::ArcStr`  |     39.1 |      167.5 |      552.2
+`ArcColdString`   |      8.0 |      167.5 |      552.1
+`ArcColdString32` |      8.0 |      151.4 |      536.8
+
+### Reference Counting Speed Comparison
+
+Criterion point estimates in nanoseconds per operation on 64-bit Windows
+(release mode, 100 samples). Lower is better. Allocation and clone outputs are
+dropped outside the timed region; drop measures a non-final reference-count
+decrement.
+
+Fresh allocation and string copy:
+
+Type             | 16 bytes | 128 bytes | 512 bytes
+:---             |     ---: |      ---: |      ---:
+`Arc<str>`       |     28.03 |      29.57 |      36.98
+`arcstr::ArcStr` |     27.19 |      28.70 |      38.46
+`ArcColdString`  |     30.12 |      32.61 |      43.70
+
+Clone/reference-count increment:
+
+Type             | 16 bytes | 128 bytes | 512 bytes
+:---             |     ---: |      ---: |      ---:
+`Arc<str>`       |      3.86 |       3.82 |       3.82
+`arcstr::ArcStr` |      3.39 |       3.41 |       3.43
+`ArcColdString`  |      3.44 |       3.45 |       3.43
+
+String access:
+
+Type             | 16 bytes | 128 bytes | 512 bytes
+:---             |     ---: |      ---: |      ---:
+`Arc<str>`       |      1.02 |       1.03 |       1.04
+`arcstr::ArcStr` |      1.02 |       1.02 |       1.02
+`ArcColdString`  |      1.38 |       1.68 |       1.70
+
+Non-final drop/reference-count decrement:
+
+Type             | 16 bytes | 128 bytes | 512 bytes
+:---             |     ---: |      ---: |      ---:
+`Arc<str>`       |      2.43 |       2.49 |       2.43
+`arcstr::ArcStr` |      2.52 |       2.53 |       2.52
+`ArcColdString`  |      2.17 |       2.18 |       2.19
 
 ## License
 
