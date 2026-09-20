@@ -66,10 +66,10 @@ assert_eq!(size_of::<Option<ColdString>>(), size_of::<ColdString>());
 ColdString is an 8-byte tagged pointer (4 bytes on 32-bit machines):
 
 Internally, both string types use a one-word tagged pointer representation.
-`ColdString` points to a `[variable-length length][UTF-8 bytes]` allocation,
+`ColdString` points to a `[variable-length (length - inline capacity)][UTF-8 bytes]` allocation,
 while `ArcColdString` adds an atomic reference count before the same payload.
 The 8 bytes encode one of three representations indicated by the 1st byte:
-- `10xxxxxx`: `encoded` contains a tagged heap pointer. To decode the address, clear the tag bits (`10 → 00`) and rotate so the `00` bits become the least-significant bits. The heap allocation uses [4-byte alignment](https://doc.rust-lang.org/beta/std/alloc/struct.Layout.html#method.from_size_align), guaranteeing the least-significant 2 bits of the address are `00`. On the heap, the UTF-8 characters are preceded by the variable-length encoding of the size. The size uses 1 byte for 0 - 127, 2 bytes for 128 - 16383, etc.
+- `10xxxxxx`: `encoded` contains a tagged heap pointer. To decode the address, clear the tag bits (`10 → 00`) and rotate so the `00` bits become the least-significant bits. The heap allocation uses [4-byte alignment](https://doc.rust-lang.org/beta/std/alloc/struct.Layout.html#method.from_size_align), guaranteeing the least-significant 2 bits of the address are `00`. On the heap, the UTF-8 characters are preceded by a variable-length encoding of `length - size_of::<usize>()`, since strings up to one word are stored inline. Encoded values 1–127 use one byte, 128–16,383 use two bytes, and so on. On a 64-bit target, those ranges correspond to actual string lengths 9–135 and 136–16,391.
 - `11111xxx`: xxx is the length and the remaining 0-7 bytes are UTF-8 characters.
 - `xxxxxxxx`: All 8 bytes are UTF-8.
 
