@@ -6,12 +6,12 @@ use core::{
     slice,
 };
 
-use crate::vint::VarInt;
+use crate::{encoded::WIDTH, vint::VarInt};
 
 pub(crate) const HEAP_ALIGN: usize = 4;
 
 /// A heap string with an arbitrary fixed-size header followed by
-/// `[vint length][UTF-8 bytes]`.
+/// `[vint (length - WIDTH)][UTF-8 bytes]`.
 #[repr(C)]
 pub(crate) struct VintStringInner<H> {
     pub(crate) header: H,
@@ -35,8 +35,15 @@ impl<H> VintStringInner<H> {
     }
 
     #[inline]
+    unsafe fn read_len(payload: *const u8) -> (usize, usize) {
+        let (stored_len, vint_len) = VarInt::read(payload);
+        (stored_len + WIDTH, vint_len)
+    }
+
+    #[inline]
     pub(crate) fn allocate(header: H, s: &str) -> NonNull<Self> {
-        let (vint_len, len_buf) = VarInt::write(s.len() as u64);
+        assert!(s.len() > WIDTH, "heap string must exceed inline capacity");
+        let (vint_len, len_buf) = VarInt::write((s.len() - WIDTH) as u64);
         let layout = Self::layout(s.len(), vint_len);
 
         unsafe {
@@ -59,7 +66,7 @@ impl<H> VintStringInner<H> {
     #[inline]
     pub(crate) unsafe fn as_bytes<'a>(ptr: NonNull<Self>) -> &'a [u8] {
         let payload = Self::payload(ptr);
-        let (len, vint_len) = VarInt::read(payload);
+        let (len, vint_len) = Self::read_len(payload);
         slice::from_raw_parts(payload.add(vint_len), len)
     }
 
@@ -67,7 +74,7 @@ impl<H> VintStringInner<H> {
     #[inline]
     pub(crate) unsafe fn deallocate(ptr: NonNull<Self>) {
         let payload = Self::payload(ptr);
-        let (len, vint_len) = VarInt::read(payload);
+        let (len, vint_len) = Self::read_len(payload);
         let layout = Self::layout(len, vint_len);
 
         ptr::drop_in_place(ptr::addr_of_mut!((*ptr.as_ptr()).header));
