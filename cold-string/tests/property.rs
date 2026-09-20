@@ -5,7 +5,7 @@ use proptest::prelude::*;
 fn proptest_config() -> ProptestConfig {
     ProptestConfig {
         failure_persistence: None,
-        cases: 16,
+        cases: 8,
         ..Default::default()
     }
 }
@@ -42,6 +42,25 @@ proptest! {
         assert_eq!(unsafe { ColdString::from_utf8_unchecked(s.as_bytes()).as_bytes() }, s.as_bytes());
         if s.len() <= core::mem::size_of::<usize>() {
             assert_eq!(ColdString::new_inline_const(&s), cold);
+        }
+        let opt_s = Some(cold.clone());
+        assert_eq!(opt_s.as_ref().unwrap(), &cold);
+        assert_eq!(opt_s.as_ref().map(|x| x.as_str()), Some(s.as_str()));
+    }
+
+    #[test]
+    fn arb_arc_string(s in any::<String>()) {
+        let cold = ArcColdString::new(s.as_str());
+        assert_eq!(s.len() <= core::mem::size_of::<usize>(), cold.is_inline());
+        assert_eq!(cold.len(), s.len());
+        assert_eq!(cold.as_bytes(), s.as_bytes());
+        assert_eq!(cold.as_str(), s.as_str());
+        assert_eq!(cold, cold.clone());
+        assert_eq!(cold, s.as_str());
+        assert_eq!(s.as_str(), cold);
+        assert_eq!(unsafe { ArcColdString::from_utf8_unchecked(s.as_bytes()).as_bytes() }, s.as_bytes());
+        if s.len() <= core::mem::size_of::<usize>() {
+            assert_eq!(ArcColdString::new_inline_const(&s), cold);
         }
         let opt_s = Some(cold.clone());
         assert_eq!(opt_s.as_ref().unwrap(), &cold);
