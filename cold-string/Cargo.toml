@@ -17,10 +17,13 @@ maintenance = { status = "actively-developed" }
 
 [features]
 default = []
+nightly = []
 serde = ["dep:serde", "serde/alloc"]
 rkyv = ["dep:rkyv", "rkyv/alloc", "rkyv/bytecheck"]
 
 [dependencies]
+# the version of allocator-api2 should be aligned with bumpalo
+allocator-api2 = { version = "0.2.8", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.228", optional = true, default-features = false }
 rkyv = { version = "0.8.15", optional = true, default-features = false }
 portable-atomic = { version = "1.15.0", default-features = false, features = ["require-cas"] }
